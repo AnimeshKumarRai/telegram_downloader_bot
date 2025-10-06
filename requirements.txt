@@ -1,0 +1,14 @@
+python-telegram-bot==21.4
+yt-dlp>=2024.08.06
+pydantic==2.9.0
+sqlalchemy==2.0.34
+asyncpg>=0.29.0
+aiosqlite>=0.19.0
+redis>=5.0.0
+loguru>=0.7.2
+aiohttp>=3.9.5
+tenacity>=8.2.3
+python-slugify>=8.0.4
+humanize>=4.9.0
+pydantic-settings
+python-dotenv
