@@ -1,0 +1,36 @@
+services:
+  bot:
+    build: .
+    container_name: telegram_bot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./downloads:/app/downloads
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: telegram_downloader_bot   
+      POSTGRES_PASSWORD: mysecretpassword123      
+      POSTGRES_DB: telegram_db               
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: redis
+    restart: always
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:

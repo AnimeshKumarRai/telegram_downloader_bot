@@ -12,3 +12,4 @@ python-slugify>=8.0.4
 humanize>=4.9.0
 pydantic-settings
 python-dotenv
+backoff>=2.2.1
