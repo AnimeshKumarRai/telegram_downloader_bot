@@ -28,7 +28,7 @@ A Telegram bot for downloading media from platforms like YouTube, Instagram, Tik
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/yourusername/telegram_downloader_bot.git
+   git clone https://github.com/AnimeshKumarRai/telegram_downloader_bot.git
    cd telegram_downloader_bot
    ```
 
@@ -119,11 +119,13 @@ telegram_downloader_bot/
 ├── start.py            # /start command handler
 ├── help.py             # /help command handler
 ├── download.py         # Download-related command handlers
+├── downloader.py       # Download Logic
 ├── admin.py            # Admin command handlers
 ├── group.py            # Group-related handlers
 ├── cleanup.py          # Cleanup loop for temporary files
 ├── .env                # Environment variables (not tracked)
 ├── requirements.txt    # Python dependencies
+└── more essential files.....
 ```
 
 ## Contributing
@@ -148,4 +150,4 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## Support
 
-For issues or questions, open an issue on GitHub or contact the bot admin via Telegram.
+For issues or questions, open an issue on GitHub or contact the bot admin via Telegram. More features soon...
