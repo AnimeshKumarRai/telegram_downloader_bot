@@ -45,8 +45,9 @@ def _base_ydl_opts(tmp_dir: str, progress_hook: Optional[Callable] = None, forma
         ),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.snapchat.com/",
+        "Referer": "https://www.instagram.com/",  # ✅ Changed from snapchat
     }
+    
     opts: dict[str, Any] = {
         "outtmpl": os.path.join(tmp_dir, "%(id)s_{unique_id}.%(ext)s"),
         "noplaylist": True,
@@ -54,20 +55,34 @@ def _base_ydl_opts(tmp_dir: str, progress_hook: Optional[Callable] = None, forma
         "no_warnings": True,
         "retries": 10,
         "concurrent_fragment_downloads": 8,
-        "merge_output_format": "mp4",
+        "merge_output_format": "mp4",  # ✅ Force mp4 output
         "http_headers": mobile_headers,
-        "allow_unplayable_formats": True,   # 🔑 allow m3u8/dash
-        "ignoreerrors": "only_download",    # don’t abort on bad formats
         "postprocessors": [
-            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+            {
+                "key": "FFmpegVideoRemuxer", 
+                "preferedformat": "mp4"
+            },
+            {
+                "key": "FFmpegMetadata"  # ✅ Preserve metadata
+            },
         ],
     }
-    if _settings.ytdlp_cookies_path:
+    
+    # ✅ CRITICAL FIX: Proper format selection for Instagram/Facebook
+    if format_str:
+        # User selected a specific format - merge with audio
+        opts["format"] = f"({format_str}+bestaudio/best)"
+    else:
+        # Default: best video+audio merged
+        opts["format"] = "bestvideo*+bestaudio/best"
+    
+    # Optional: Only add cookies if path is set (you can skip this)
+    if _settings.ytdlp_cookies_path and os.path.exists(_settings.ytdlp_cookies_path):
         opts["cookiefile"] = _settings.ytdlp_cookies_path
+    
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
-    if format_str:
-        opts["format"] = format_str
+    
     return opts
 
 
@@ -89,12 +104,30 @@ async def analyze(url: str, cached_formats: set[str]) -> MediaInfo:
     with tempfile.TemporaryDirectory(dir=_settings.download_dir) as tmp_dir_str:
         tmp_dir = tmp_dir_str
         ydl_opts = _base_ydl_opts(tmp_dir)
-        ydl_opts['format'] = None  # Disable format selection for safe metadata extraction (fixes Instagram errors)
         
-        # Snapchat-specific retry: Force progressive formats if extractor is SnapchatSpotlight
+        # ✅ Platform-specific format selection
         is_snapchat = 'snapchat' in url.lower()
+        is_instagram = 'instagram.com' in url.lower() or 'instagr.am' in url.lower()
+        is_facebook = 'facebook.com' in url.lower() or 'fb.watch' in url.lower() or 'fb.me' in url.lower()
+        
         if is_snapchat:
-            ydl_opts['format'] = 'best[height<=720]/best'  # Prefer medium, fallback best
+            ydl_opts['format'] = 'best[height<=720]/best'
+        elif is_instagram:
+            # ✅ Instagram fix: Force merged format
+            ydl_opts['format'] = 'bestvideo*+bestaudio/best'
+            # Use mobile headers for better compatibility
+            ydl_opts['http_headers']['User-Agent'] = (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            )
+        elif is_facebook:
+            # ✅ Facebook public videos: Use progressive formats first
+            ydl_opts['format'] = 'bestvideo*+bestaudio/best/bestvideo/best'
+            # Desktop UA works better for Facebook
+            ydl_opts['http_headers']['User-Agent'] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         
         def _extract(attempt=1) -> dict:
             with YoutubeDL(ydl_opts) as ydl:
@@ -102,17 +135,20 @@ async def analyze(url: str, cached_formats: set[str]) -> MediaInfo:
                     return ydl.extract_info(url, download=False)
                 except Exception as e:
                     logger.warning(f"Extraction attempt {attempt} failed: {e}")
-                    if attempt == 1 and is_snapchat:
-                        # Retry with desktop UA for Snapchat
-                        ydl_opts['http_headers']['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    if attempt == 1 and (is_instagram or is_facebook):
+                        # Retry with different UA
+                        ydl_opts['http_headers']['User-Agent'] = (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        )
                         return _extract(attempt=2)
-                    raise e  # Re-raise on final fail
+                    raise e
         
         try:
             info = await asyncio.to_thread(_extract)
         except Exception as e:
             logger.error(f"Analyze failed for {url}: {e}")
-            # Fallback empty MediaInfo for graceful error
+            # Fallback empty MediaInfo
             return MediaInfo(
                 provider="unknown",
                 title="Failed to analyze",
@@ -203,33 +239,54 @@ async def analyze(url: str, cached_formats: set[str]) -> MediaInfo:
 
 async def download(url: str, fmt: FormatOption, tmp_dir: str, progress_cb=None):
     """Download to provided tmp_dir (caller cleans)."""
-    unique_id = str(uuid.uuid4()).replace('-', '')  # Full UUID without dashes for filename safety
-    ydl_opts = _base_ydl_opts(tmp_dir, progress_hook=progress_cb, format_str=fmt.format_id)
-    # Inject unique_id into opts for outtmpl (now shorter, no title)
+    unique_id = str(uuid.uuid4()).replace('-', '')
+    
+    # ✅ Detect platform for format override
+    is_instagram = 'instagram.com' in url.lower() or 'instagr.am' in url.lower()
+    is_facebook = 'facebook.com' in url.lower() or 'fb.watch' in url.lower()
+    
+    # ✅ Format string with audio merging
+    if is_instagram or is_facebook:
+        # Always merge audio for these platforms
+        format_str = f"({fmt.format_id})+bestaudio/best"
+    else:
+        format_str = fmt.format_id
+    
+    ydl_opts = _base_ydl_opts(tmp_dir, progress_hook=progress_cb, format_str=format_str)
     ydl_opts['outtmpl'] = ydl_opts['outtmpl'].format(unique_id=unique_id)
+    
+    # ✅ Add FFmpeg audio codec fix for Instagram
+    if is_instagram:
+        ydl_opts['postprocessors'].append({
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        })
+    
     def _run() -> dict:
         with YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(url, download=True)
             return res
+    
     info = await asyncio.to_thread(_run)
-    # Find resulting file (now simpler pattern: %(id)s_{unique_id}.%(ext)s)
+    
+    # Find resulting file
     ext = fmt.ext or info.get("ext") or "mp4"
     vid_id = info.get('id')
     candidates = list(Path(tmp_dir).glob(f"{vid_id}_{unique_id}.*"))
+    
     p = None
     if candidates:
-        # Prefer .mp4 if multiple (e.g., .part then final)
         mp4_cand = [c for c in candidates if c.suffix == '.mp4']
         if mp4_cand:
             p = max(mp4_cand, key=lambda x: x.stat().st_mtime)
         else:
             p = max(candidates, key=lambda x: x.stat().st_mtime)
+    
     if not p or not p.exists():
         requested_filename = info.get("_filename")
         if requested_filename and Path(requested_filename).exists():
             p = Path(requested_filename)
         else:
             raise RuntimeError("Download finished but file not found")
-    # Note: Path is returned; caller MUST delete p after sending (e.g., p.unlink() in finally block)
-    # The temp_dir is auto-cleaned after this context, but if p is outside (rare), handle manually
+    
     return p, info
