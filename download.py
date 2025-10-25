@@ -5,15 +5,24 @@ import math
 import os
 import time
 import traceback
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    HAS_RESOLVER = True
+except ImportError:
+    HAS_RESOLVER = False
 
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputFile,
+    InputMediaPhoto,
 )   
 from telegram.ext import ContextTypes
 from sqlalchemy import select
@@ -44,6 +53,145 @@ def temp_download_dir(base_dir=None):
         yield tmp_dir
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+def resolve_facebook_share(url: str) -> str:
+    """Resolve Facebook share/r/ short links to the actual reel URL with multiple fallback methods."""
+    if not HAS_RESOLVER or '/share/r/' not in url:
+        return url
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+        }
+        
+        # Method 1: Follow redirects with session
+        session = requests.Session()
+        session.headers.update(headers)
+        
+        # Add some common cookies that might help
+        session.cookies.update({
+            'locale': 'en_US',
+            'wd': '1920x1080',
+        })
+        
+        resp = session.get(url, allow_redirects=True, timeout=20)
+        final_url = resp.url
+        
+        logger.info(f"Facebook share resolution - Initial redirect: {url} -> {final_url}")
+        
+        # Check if we got a reel URL directly from redirects
+        if '/reel/' in final_url:
+            return final_url
+        
+        # Method 2: Parse HTML for various patterns
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # Try multiple meta tag patterns
+        meta_patterns = [
+            {'property': 'og:url'},
+            {'name': 'og:url'},
+            {'property': 'al:web:url'},
+            {'name': 'twitter:url'},
+        ]
+        
+        for pattern in meta_patterns:
+            meta_tag = soup.find('meta', pattern)
+            if meta_tag and meta_tag.get('content'):
+                meta_url = meta_tag['content']
+                if '/reel/' in meta_url:
+                    logger.info(f"Found reel URL via meta tag {pattern}: {meta_url}")
+                    return meta_url
+                elif '/watch/' in meta_url or 'video_id' in meta_url:
+                    logger.info(f"Found video URL via meta tag: {meta_url}")
+                    return meta_url
+        
+        # Method 3: Look for canonical links
+        canonical = soup.find('link', {'rel': 'canonical'})
+        if canonical and canonical.get('href'):
+            canon_url = canonical['href']
+            if any(x in canon_url for x in ['/reel/', '/watch/', 'video_id']):
+                logger.info(f"Found canonical URL: {canon_url}")
+                return canon_url
+        
+        # Method 4: Advanced regex patterns for reel/video IDs
+        html_text = resp.text
+        
+        # Pattern 1: Direct reel ID in various JSON structures
+        reel_patterns = [
+            r'"reel_id":"(\d+)"',
+            r'reel_id[\'"]?\s*:\s*[\'"]?(\d+)',
+            r'/"reel/(\d+)/?"',
+            r'content_id["\']?:\s*["\']?(\d+)',
+            r'video:url["\']?\s*content["\']?\s*:\s*["\']?[^"\']*reel/(\d+)',
+        ]
+        
+        for pattern in reel_patterns:
+            matches = re.findall(pattern, html_text, re.IGNORECASE)
+            for reel_id in matches:
+                if reel_id.isdigit():
+                    resolved = f"https://www.facebook.com/reel/{reel_id}"
+                    logger.info(f"Found reel ID via regex {pattern}: {resolved}")
+                    return resolved
+        
+        # Pattern 2: Video IDs
+        video_patterns = [
+            r'"video_id":"(\d+)"',
+            r'video_id[\'"]?\s*:\s*[\'"]?(\d+)',
+            r'/"video/(\d+)/?"',
+            r'watch/\?v=(\d+)',
+        ]
+        
+        for pattern in video_patterns:
+            matches = re.findall(pattern, html_text, re.IGNORECASE)
+            for video_id in matches:
+                if video_id.isdigit():
+                    resolved = f"https://www.facebook.com/watch/?v={video_id}"
+                    logger.info(f"Found video ID via regex {pattern}: {resolved}")
+                    return resolved
+        
+        # Method 5: Look for Facebook's internal data structures
+        json_patterns = [
+            r'{"id":"(\d+)"[^}]*"__typename":"Video',
+            r'video":{"id":"(\d+)"',
+            r'"video_id":"(\d+)"[^}]*"owner"',
+        ]
+        
+        for pattern in json_patterns:
+            matches = re.findall(pattern, html_text)
+            for video_id in matches:
+                if video_id.isdigit():
+                    # Try both formats
+                    resolved = f"https://www.facebook.com/watch/?v={video_id}"
+                    logger.info(f"Found video ID via JSON pattern {pattern}: {resolved}")
+                    return resolved
+        
+        # Method 6: If we have a mobile URL, try converting to desktop
+        if 'm.facebook.com' in final_url:
+            desktop_url = final_url.replace('m.facebook.com', 'www.facebook.com')
+            logger.info(f"Converted mobile to desktop URL: {desktop_url}")
+            return desktop_url
+            
+        # Method 7: Last resort - try common Facebook video patterns
+        if 'facebook.com/stories/' in final_url or 'facebook.com/watch/' in final_url:
+            logger.info(f"Using final URL as fallback: {final_url}")
+            return final_url
+        
+        logger.warning(f"All resolution methods failed for: {url}")
+        return url  # Return original if all methods fail
+        
+    except Exception as e:
+        logger.warning(f"Failed to resolve Facebook share link {url}: {e}")
+        return url  # Return original URL on failure
+    
 
 # ---------------------------
 # Auth Helpers
@@ -188,6 +336,8 @@ async def _send_from_cache(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             await msg.reply_video(video=item.telegram_file_id, caption=caption, supports_streaming=True)
         elif item.content_type == "audio":
             await msg.reply_audio(audio=item.telegram_file_id, caption=caption)
+        elif item.content_type == "image":
+            await msg.reply_photo(photo=item.telegram_file_id, caption=caption)
         else:
             await msg.reply_document(document=item.telegram_file_id, caption=caption)
         return True
@@ -297,15 +447,14 @@ async def _extract_direct_url(url: str, format_id: str) -> Optional[str]:
 
 
 def _choose_smaller_format(info: MediaInfo, max_bytes: int, prefer_same_ext: Optional[str] = None) -> Optional[FormatOption]:
-    # Choose best video format that has known filesize <= max_bytes
+    # Choose best video/image format that has known filesize <= max_bytes
     candidates = []
     for f in info.formats:
-        if f.content_type != "video":
-            continue
-        if f.filesize and f.filesize <= max_bytes:
-            candidates.append(f)
+        if f.content_type in ("video", "image"):
+            if f.filesize and f.filesize <= max_bytes:
+                candidates.append(f)
     if not candidates:
-        # fallback: audio if no video fits
+        # fallback: audio if no video/image fits
         for f in info.formats:
             if f.content_type == "audio" and f.filesize and f.filesize <= max_bytes:
                 candidates.append(f)
@@ -433,8 +582,8 @@ async def _extract_audio_file(input_path: Path) -> Path:
 # Handlers: main flow
 # ---------------------------
 
-async def pick_medium_format(info: MediaInfo) -> Optional[FormatOption]:
-    """Pick 'medium' quality: highest res <=720p, or closest, or any video, fallback to best."""
+def pick_medium_format(info: MediaInfo) -> Optional[FormatOption]:
+    """Pick 'medium' quality: highest res <=720p, or closest, or any video/image, fallback to best."""
     video_formats = [f for f in info.formats if f.content_type == "video" and hasattr(f, 'height') and f.height]
     if video_formats:
         # Prefer <=720p, highest height
@@ -446,13 +595,18 @@ async def pick_medium_format(info: MediaInfo) -> Optional[FormatOption]:
             return abs(f.height - 720)
         return min(video_formats, key=closeness)
     
+    # Images
+    image_formats = [f for f in info.formats if f.content_type == "image"]
+    if image_formats:
+        return max(image_formats, key=lambda f: f.filesize or 0)
+    
     # Broader fallback: Any video (even without height)
     any_video = next((f for f in info.formats if f.content_type == "video"), None)
     if any_video:
         return any_video
     
     # Last resort: Best overall (from _pick_best_format)
-    return await _pick_best_format(info)
+    return _pick_best_format(info)
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quick: Optional[str] = None, is_private: bool = True):
@@ -460,6 +614,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: st
     logger.info(f"Caught and analyzing link: {url}")
     user = update.effective_user
     msg = update.effective_message
+
+    original_url = url
+    
+    # Resolve Facebook share short links for better yt-dlp compatibility
+    if 'facebook.com' in url and '/share/r/' in url:
+        resolved_url = resolve_facebook_share(url)
+        if resolved_url != url:
+            logger.info(f"Resolved Facebook share link: {url} -> {resolved_url}")
+            url = resolved_url
 
     # Auth check for private chats
     if is_private and not await is_user_authenticated(user.id):
@@ -472,18 +635,50 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: st
         return
 
     started = time.time()
+    
+    # Try with resolved URL first
+    cached_by_fmt = await _get_cached_formats(url)
+    cached_format_ids = set(cached_by_fmt.keys())
+    info = await analyze(url, cached_format_ids)
+    
+    # If resolved URL fails and we have a different URL, try original
+    if info is None and url != original_url:
+        logger.info(f"Resolved URL failed, trying original: {original_url}")
+        cached_by_fmt_orig = await _get_cached_formats(original_url)
+        cached_format_ids_orig = set(cached_by_fmt_orig.keys())
+        info = await analyze(original_url, cached_format_ids_orig)
+        if info:
+            url = original_url  # Use original URL if it works
+    
     try:
-        cached_by_fmt = await _get_cached_formats(url)
-        cached_format_ids = set(cached_by_fmt.keys())
-        info = await analyze(url, cached_format_ids)
+        if info is None:
+            # If still None, provide specific guidance for Facebook
+            if 'facebook.com' in url:
+                error_msg = (
+                    "⚠️ Facebook link resolution failed.\n\n"
+                    "This usually happens with:\n"
+                    "• Private/restricted content\n" 
+                    "• Regional blocking\n"
+                    "• Age-restricted videos\n"
+                    "• Temporary Facebook issues\n\n"
+                    "Try:\n"
+                    "• Using the direct reel URL instead of share link\n"
+                    "• Checking if the video is publicly accessible\n"
+                    "• Waiting and trying again later"
+                )
+            else:
+                error_msg = "❌ Failed to analyze link. The URL might be unsupported, private, or temporarily unavailable."
+                
+            await msg.reply_text(error_msg)
+            await _log_job(user.id, msg.chat_id, url, "unknown", "error", started, "Analyze returned None")
+            return
         
-
         # quick modes
         if quick in ("best", "audio", "medium"):
             if quick == "medium":
-                chosen = await pick_medium_format(info)  # <-- Awaited
+                chosen = pick_medium_format(info)
             else:
-                chosen = await _pick_best_format(info, audio_only=(quick == "audio"))
+                chosen = _pick_best_format(info, audio_only=(quick == "audio"))
             if not chosen:
                 await msg.reply_text("No suitable formats found.")
                 await _log_job(user.id, msg.chat_id, url, info.provider, "error", started, "No formats")
@@ -500,12 +695,29 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: st
     except Exception as e:
         logger.exception("Analyze error")
         logger.error(f"Analyze error for {url}: {e}")
-        await msg.reply_text(f"Failed to analyze link. {str(e)}")
+        
+        # Special handling for Facebook errors
+        if 'facebook.com' in url:
+            fb_error_msg = (
+                f"🚫 Facebook download error: {str(e)}\n\n"
+                "Facebook videos often require:\n"
+                "• Publicly accessible content\n"
+                "• No age restrictions\n" 
+                "• Proper authentication cookies\n\n"
+                "Try getting the direct reel URL from your browser."
+            )
+            await msg.reply_text(fb_error_msg)
+        else:
+            await msg.reply_text(f"❌ Download error: {str(e)}")
+            
         await _log_job(user.id, msg.chat_id, url, "unknown", "error", started, traceback.format_exc())
 
 
-async def _pick_best_format(info: MediaInfo, audio_only: bool = False) -> Optional[FormatOption]:
-    candidates = [f for f in info.formats if (f.content_type == "audio" if audio_only else f.content_type == "video")]
+def _pick_best_format(info: MediaInfo, audio_only: bool = False) -> Optional[FormatOption]:
+    if audio_only:
+        candidates = [f for f in info.formats if f.content_type == "audio"]
+    else:
+        candidates = [f for f in info.formats if f.content_type in ("video", "image")]
     if not candidates:
         candidates = info.formats
     return candidates[0] if candidates else None
@@ -587,9 +799,9 @@ async def _perform_download_send(
                     chosen = alt
                 else:
                     # fallback to audio if nothing fits
-                    aud = await _pick_best_format(info, audio_only=True)
+                    aud = _pick_best_format(info, audio_only=True)
                     if aud:
-                        await msg.reply_text("No video fits your limit; falling back to best audio.")
+                        await msg.reply_text("No video/image fits your limit; falling back to best audio.")
                         chosen = aud
                     else:
                         await msg.reply_text("No format fits within your size limit.")
@@ -687,28 +899,52 @@ async def _perform_download_send(
             sent_messages = []
 
             # Send files (possibly multiple parts)
-            for idx, p in enumerate(final_paths, start=1):
-                part_caption = caption if len(final_paths) == 1 else f"{caption}\nPart {idx}/{len(final_paths)}"
-                with open(p, "rb") as f:
-                    file_input = InputFile(f, filename=p.name)
-                    if content_type == "video" and not (await get_user_prefs(user.id)).get("prefer_document"):
-                        sent = await msg.reply_video(video=file_input, caption=part_caption, supports_streaming=True)
-                    elif content_type == "audio":
-                        sent = await msg.reply_audio(audio=file_input, caption=part_caption)
-                    else:
-                        sent = await msg.reply_document(document=file_input, caption=part_caption)
-                    sent_messages.append(sent)
-                # Extra clean (optional; context handles dir)
-                p.unlink(missing_ok=True)
+            prefs = await get_user_prefs(user.id)
+            if content_type == "image" and len(final_paths) > 1:
+                # Send as media group for image carousels
+                media = []
+                for i, p in enumerate(final_paths):
+                    size_p = p.stat().st_size
+                    with open(p, "rb") as f:
+                        cap = caption if i == 0 else None
+                        media.append(InputMediaPhoto(media=InputFile(f, filename=p.name), caption=cap))
+                sent_messages = await msg.reply_media_group(media=media)
+            else:
+                # Single or non-image multiple
+                for idx, p in enumerate(final_paths, start=1):
+                    part_caption = caption if len(final_paths) == 1 else f"{caption}\nPart {idx}/{len(final_paths)}"
+                    size_p = p.stat().st_size
+                    with open(p, "rb") as f:
+                        file_input = InputFile(f, filename=p.name)
+                        if content_type == "video" and not prefs.get("prefer_document", False):
+                            sent = await msg.reply_video(video=file_input, caption=part_caption, supports_streaming=True)
+                        elif content_type == "audio":
+                            sent = await msg.reply_audio(audio=file_input, caption=part_caption)
+                        elif content_type == "image":
+                            if size_p > 10 * 1024 * 1024:
+                                sent = await msg.reply_document(document=file_input, caption=part_caption)
+                            else:
+                                sent = await msg.reply_photo(photo=file_input, caption=part_caption)
+                        else:
+                            sent = await msg.reply_document(document=file_input, caption=part_caption)
+                        sent_messages.append(sent)
+                    # Extra clean (optional; context handles dir)
+                    p.unlink(missing_ok=True)
 
         await progress_message.delete()
 
-        # Save to cache only when we didn't alter the file (no split/transcode/audio from video)
+        # Save to cache only when we didn't alter the file (no split/transcode/audio from video) and single
         if forced_action is None and len(final_paths) == 1:
             sent = sent_messages[0]
             try:
                 async with SessionLocal() as ses:
                     uh = url_hash(url)
+                    telegram_file_id = (
+                        sent.video.file_id if hasattr(sent, "video") else
+                        sent.audio.file_id if hasattr(sent, "audio") else
+                        sent.photo.file_id if hasattr(sent, "photo") else
+                        sent.document.file_id
+                    )
                     ses.add(CacheItem(
                         url_hash=uh,
                         source_url=url,
@@ -717,11 +953,7 @@ async def _perform_download_send(
                         format_id=chosen.format_id,
                         content_type=chosen.content_type,
                         file_size=chosen.filesize or size_bytes,
-                        telegram_file_id=(
-                            sent.video.file_id if getattr(sent, "video", None) else
-                            sent.audio.file_id if getattr(sent, "audio", None) else
-                            sent.document.file_id
-                        ),
+                        telegram_file_id=telegram_file_id,
                         extra={"ext": chosen.ext}
                     ))
                     await ses.commit()
@@ -812,19 +1044,32 @@ async def link_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return  # Silent ignore
 
         url = urls[0]
-        started = time.time()  # <-- Define started here
+        # Resolve Facebook share short links
+        if 'facebook.com' in url and '/share/r/' in url:
+            resolved_url = resolve_facebook_share(url)
+            if resolved_url != url:
+                logger.info(f"Resolved Facebook share link to: {resolved_url}")
+                url = resolved_url
+        started = time.time()
         try:
             cached_by_fmt = await _get_cached_formats(url)
             cached_format_ids = set(cached_by_fmt.keys())
             info = await analyze(url, cached_format_ids)
-            logger.info(f"Extracted {len(info.formats)} formats for {info.provider}: {[f.note for f in info.formats[:3]]}")  # Debug log
-            chosen = await pick_medium_format(info)
+            
+            # Handle case where analyze returns None
+            if info is None:
+                logger.warning(f"Analyze returned None for {url}")
+                await msg.reply_text("No suitable media found (unsupported URL, private content, or temporary issue). Try /dl in PM for options.")
+                return
+                
+            logger.info(f"Extracted {len(info.formats)} formats for {info.provider}: {[f.note for f in info.formats[:3]]}")
+            chosen = pick_medium_format(info)
             if not chosen:
-                chosen = await _pick_best_format(info)
+                chosen = _pick_best_format(info)
             if chosen:
-                await _perform_download_send(update, context, url, info, chosen, started=time.time())
+                await _perform_download_send(update, context, url, info, chosen, started)
             else:
-                await msg.reply_text("No video formats available (unsupported URL or audio-only content). Try /dl in PM for options.")
+                await msg.reply_text("No video/image formats available (unsupported URL or audio-only content). Try /dl in PM for options.")
         except Exception as e:
             logger.error(f"Group download error: {e}")
             await msg.reply_text(f"Error analyzing link: {e}")
@@ -838,6 +1083,18 @@ async def link_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("🔒 Authenticate first with /auth <password> to download links in PM.")
             return
         await handle_url(update, context, urls[0], is_private=is_private)
+
+async def test_facebook_urls():
+    """Test function to verify Facebook URL resolution works"""
+    test_urls = [
+        "https://www.facebook.com/share/r/16M4KdgS2Q/",
+        "https://fb.watch/example/",
+        "https://www.facebook.com/reel/1234567890/",
+    ]
+    
+    for test_url in test_urls:
+        resolved = resolve_facebook_share(test_url)
+        print(f"Test: {test_url} -> {resolved}")
 
 async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
@@ -944,7 +1201,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prefs = await get_user_prefs(update.effective_user.id)
             alt = _choose_smaller_format(info, _bytes_limit_for(prefs))
             if not alt:
-                await query.edit_message_text("No smaller video fits your size limit.")
+                await query.edit_message_text("No smaller video/image fits your size limit.")
                 return
             await query.edit_message_text(f"Chosen: {alt.note}. Downloading...")
             await _perform_download_send(update, context, url, info, alt, started=time.time())
@@ -977,7 +1234,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not url or not info:
             await query.edit_message_text("Session expired. Please send the link again.")
             return
-        chosen = await _pick_best_format(info)
+        chosen = _pick_best_format(info)
         if not chosen:
             await query.edit_message_text("No suitable format.")
             return
@@ -991,7 +1248,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not url or not info:
             await query.edit_message_text("Session expired. Please send the link again.")
             return
-        chosen = await _pick_best_format(info, audio_only=True)
+        chosen = _pick_best_format(info, audio_only=True)
         if not chosen:
             await query.edit_message_text("No audio format found.")
             return

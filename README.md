@@ -68,6 +68,31 @@ A Telegram bot for downloading media from platforms like YouTube, Instagram, Tik
    python app.py
    ```
 
+7. **Docker Setup**
+   ```bash
+   docker compose up --build
+   ```
+   Some Docker you can need incase ((Use with Caution)):
+
+   i. Rebuilds without cache, ignoring previous build data and Starts services, may override
+   ```bash
+   docker compose build --no-cache  
+   docker compose up
+   ```
+   ii. Stops and removes containers, networks, and volumes. Harm: Permanently deletes data in volumes.
+   ```bash
+   docker compose down -v 
+   ```
+   iii. Removes all unused containers, images, networks, and volumes. Harm: Irreversible data loss, including unused but needed resources.
+   ```bash
+   docker system prune -af --volumes
+   ```
+   iv. Initializes a Docker setup, potentially overwriting existing configs.
+   ```bash
+   docker init 
+   ```
+
+
 ## Usage
 
 1. **Start the Bot**
