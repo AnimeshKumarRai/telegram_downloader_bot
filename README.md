@@ -41,7 +41,7 @@ A Telegram bot for downloading media from platforms like YouTube, Instagram, Tik
    Create a `.env` file in the project root with the following:
    ```bash
    TELEGRAM_TOKEN=your_telegram_bot_token
-   POSTGRES_DSN=postgresql://user:password@localhost:5432/dbname
+   POSTGRES_DSN=postgresql+asyncpg://user:password@localhost:5432/dbname
    REDIS_URL=redis://localhost:6379/0
    DOWNLOAD_DIR=./downloads
    ADMINS=123456789,987654321
